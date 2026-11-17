@@ -6,9 +6,10 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from . import store
+from . import snapshot, store
 from .config import Settings
 from .db import init_db, reader
 from .features import InputError
@@ -146,3 +147,46 @@ def get_workers() -> dict[str, Any]:
             for row in leases
         ],
     }
+
+
+@app.post("/snapshots", status_code=201, tags=["snapshots"])
+def post_snapshot() -> dict[str, Any]:
+    """Create a hot snapshot of the training database, for host migration.
+
+    The snapshot is taken with SQLite's online backup API while both workers
+    keep training: job progress, weights, checkpoints, events and leases all
+    come from one consistent commit point, batch commits are not blocked
+    while the copy runs, and the file is published atomically - a failed
+    attempt never leaves a downloadable half-made snapshot behind.
+    """
+    try:
+        info = snapshot.create_snapshot(settings.db_path, settings.snapshots_dir())
+    except snapshot.SnapshotError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return info.as_dict()
+
+
+@app.get("/snapshots", tags=["snapshots"])
+def get_snapshots() -> list[dict[str, Any]]:
+    """Published snapshots, newest first."""
+    return [info.as_dict() for info in snapshot.list_snapshots(settings.snapshots_dir())]
+
+
+@app.get("/snapshots/{snapshot_id}/download", tags=["snapshots"])
+def download_snapshot(snapshot_id: str) -> FileResponse:
+    """Download a snapshot as a self-contained SQLite file.
+
+    To restore on a new host, rename the downloaded file to ``training.db``
+    and place it on a fresh ``training-data`` volume before starting the
+    stack.  Workers resume unfinished jobs from the newest committed
+    checkpoint in the snapshot; leases left behind by the old host expire
+    normally, and completed jobs are not retrained.
+    """
+    path = snapshot.find_snapshot(settings.snapshots_dir(), snapshot_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail="snapshot not found")
+    return FileResponse(
+        path,
+        media_type=snapshot.MEDIA_TYPE,
+        filename=f"training-{snapshot_id}.db",
+    )

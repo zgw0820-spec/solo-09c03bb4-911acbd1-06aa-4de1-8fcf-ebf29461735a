@@ -44,6 +44,9 @@ docker compose up -d --build
 | `GET` | `/jobs/{job_id}` | 已确认步数、进度、损失、当前权重；完成时含 `final_weights` |
 | `GET` | `/jobs/{job_id}/checkpoints` | 全部批次断点（可按 `after_step` 增量拉取） |
 | `GET` | `/jobs/{job_id}/events` | 审计事件：创建、开始/从第几步续训、完成、丢失租约 |
+| `POST` | `/snapshots` | 创建热快照（在线备份，不阻塞训练），返回 201 与快照元信息 |
+| `GET` | `/snapshots` | 已发布快照列表（新的在前） |
+| `GET` | `/snapshots/{snapshot_id}/download` | 下载快照 SQLite 文件 |
 | `GET` | `/workers` | 工作器心跳与租约持有者 |
 | `GET` | `/health` | 健康检查 |
 
@@ -62,6 +65,43 @@ docker compose up -d --build
    别人的完成状态改写，更不能重复提交完成事件。
 4. 完成状态由 `step == total_steps` 在提交事务内一次性置位；旧工作器无法再写入。
 5. SQLite 使用 WAL + `synchronous=FULL`，已提交的断点在进程崩溃/容器重启后仍然存在。
+
+## 热快照与宿主机迁移
+
+迁移宿主机时无需停训：`POST /snapshots` 用 SQLite 在线备份 API 在两个工作器
+仍在提交批次的情况下生成快照，`GET /snapshots/{snapshot_id}/download` 下载为
+单个 SQLite 文件（Swagger `/docs` 里可直接操作）。
+
+- **同一提交时点**：备份 API 复制的是单一已提交状态，快照中的任务进度、权重、
+  断点、事件和租约彼此一致，绝不包含半个批次提交。
+- **不阻塞训练**：数据库运行在 WAL 模式，备份作为读者不妨碍工作器确认新批次。
+- **不暴露半成品**：快照先写入快照目录（默认 `/data/snapshots`，即
+  `training-data` 卷内）的隐藏临时文件，通过 `quick_check` 与表结构校验并
+  fsync 后才原子改名发布；失败会删除临时文件，下载接口永远拿不到残缺文件。
+
+恢复到新宿主机（全新数据卷）：
+
+```bash
+# 旧宿主机：创建并下载快照
+curl -X POST http://localhost:8000/snapshots
+curl -OJ http://localhost:8000/snapshots/<snapshot_id>/download
+
+# 新宿主机：把快照放进全新数据卷（先建卷，再拷贝，最后启动）
+docker volume create fan-training_training-data
+docker run --rm -v fan-training_training-data:/data -v "$PWD":/backup alpine \
+    cp /backup/training-<snapshot_id>.db /data/training.db
+docker compose up -d --build
+```
+
+恢复后的行为：
+
+- API 直接读出快照中的原有任务、断点、事件与租约；
+- 工作器从快照内**最近的已确认断点**接续未完成任务，最终权重与不中断训练
+  逐位一致；
+- 快照里遗留的租约来自旧宿主机，其心跳不再更新，`TRAINING_LEASE_SECONDS`
+  到期后由新工作器接管（`epoch + 1`），任务不会永久停滞；若新工作器与旧持有
+  者同名，则直接续租接着训练；
+- 已完成任务状态为 `completed`，不会被重新训练。
 
 ## 演示与验证
 
@@ -92,6 +132,7 @@ python3 -m pytest -q
 | `TRAINING_HEARTBEAT_INTERVAL` | `1.0` | 心跳间隔（必须小于租约） |
 | `TRAINING_POLL_INTERVAL` | `0.3` | 空闲轮询/批间间隔 |
 | `TRAINING_BATCH_DELAY_SECONDS` | `0` | 模拟每批耗时，便于演示 |
+| `TRAINING_SNAPSHOT_DIR` | `$TRAINING_DATA_DIR/snapshots` | 热快照存放目录 |
 | `TRAINING_DEMO_PAUSE_FILE` | 未设置 | 演示用：文件存在时在批间暂停（不心跳） |
 | `TRAINING_DEMO_CRASH_AFTER` | 未设置 | 演示用：指定步数提交后 `os._exit` |
 
@@ -102,10 +143,11 @@ app/main.py       API 与 Swagger
 app/worker.py     工作器主循环、租约续训
 app/store.py      任务状态机、批次提交、断点查询
 app/lease.py      租约获取/续约/围栏校验
+app/snapshot.py   热快照：在线备份、校验、原子发布
 app/model.py      逻辑回归、交叉熵、SGD + 动量
 app/features.py   输入校验与标准化
 app/db.py         SQLite 连接与表结构
-tests/            单元、API、进程级集成测试
+tests/            单元、API、快照与进程级集成测试
 scripts/demo.py   Swagger 同款接口的端到端演示
 scripts/selftest.py  无 Docker 自检
 ```

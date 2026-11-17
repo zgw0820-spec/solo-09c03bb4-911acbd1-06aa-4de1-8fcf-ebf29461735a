@@ -28,18 +28,31 @@ class Settings:
     heartbeat_interval: float
     poll_interval: float
     batch_delay_seconds: float
+    snapshot_dir: Path | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
         data_dir = Path(os.environ.get("TRAINING_DATA_DIR", str(ROOT / "data")))
         db_path = Path(os.environ.get("TRAINING_DB_PATH", str(data_dir / "training.db")))
+        snapshot_dir = os.environ.get("TRAINING_SNAPSHOT_DIR")
         return cls(
             db_path=db_path.resolve(),
             lease_seconds=_float("TRAINING_LEASE_SECONDS", 6.0),
             heartbeat_interval=_float("TRAINING_HEARTBEAT_INTERVAL", 1.0),
             poll_interval=_float("TRAINING_POLL_INTERVAL", 0.3),
             batch_delay_seconds=_float("TRAINING_BATCH_DELAY_SECONDS", 0.0),
+            snapshot_dir=Path(snapshot_dir).resolve() if snapshot_dir else None,
         )
+
+    def snapshots_dir(self) -> Path:
+        """Directory hot snapshots are written to.
+
+        Defaults to ``snapshots/`` next to the database, so on the delivered
+        Compose setup snapshots live on the same ``training-data`` volume.
+        """
+        if self.snapshot_dir is not None:
+            return self.snapshot_dir
+        return self.db_path.parent / "snapshots"
 
     def validate(self) -> None:
         if self.lease_seconds <= 0:

@@ -6,6 +6,10 @@
 2. ``equivalence``: with real worker processes, kill one mid-training and prove
    the finished weights are bit-identical to an uninterrupted run.
 3. ``late``: a frozen (still-running) old worker cannot write after takeover.
+4. ``snapshot``: a hot snapshot taken mid-training is restored into a fresh
+   directory (a stand-in for a new Docker volume); the new stack reads the
+   original jobs, resumes the unfinished one past the leftover lease, and
+   does not retrain the completed one.
 
 Each check prints PASS/FAIL and exits non-zero if anything fails.
 """
@@ -271,6 +275,82 @@ def check_late_worker(tmp: Path) -> bool:
     return True
 
 
+def check_snapshot_restore(tmp: Path) -> bool:
+    """Hot snapshot mid-training, restored onto a fresh volume, resumes."""
+    db = tmp / "snap-source.db"
+    api, port = start_api(db)
+    done_job = post(port, "/jobs", dataset(seed=5, records=16))
+    partial_job = post(port, "/jobs", dataset(seed=11, records=24))
+    worker_a = start_worker(db, "worker-a")
+    try:
+        wait_for(
+            lambda: get(port, f"/jobs/{done_job['job_id']}")["status"] == "completed"
+            and get(port, f"/jobs/{partial_job['job_id']}")["completed_steps"] >= 3,
+            90,
+            "done job completion and partial progress",
+        )
+        meta = post(port, "/snapshots", {})
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}{meta['download_url']}", timeout=10
+        ) as response:
+            snapshot_bytes = response.read()
+    finally:
+        stop(worker_a, hard=True)  # the old host goes away mid-training
+        stop(api)
+    assert snapshot_bytes[:16] == b"SQLite format 3\x00"
+
+    # Fresh directory standing in for a brand-new Docker volume.
+    restored_db = tmp / "restored" / "training.db"
+    restored_db.parent.mkdir(parents=True)
+    restored_db.write_bytes(snapshot_bytes)
+
+    api, port = start_api(restored_db)
+    try:
+        done = get(port, f"/jobs/{done_job['job_id']}")
+        partial = get(port, f"/jobs/{partial_job['job_id']}")
+        assert done["status"] == "completed"
+        assert 3 <= partial["completed_steps"] < partial["total_steps"]
+        restored_steps = partial["completed_steps"]
+        done_checkpoints = get(port, f"/jobs/{done_job['job_id']}/checkpoints")
+        done_events = get(port, f"/jobs/{done_job['job_id']}/events")
+        leftover = [
+            lease
+            for lease in get(port, "/workers")["leases"]
+            if lease["job_id"] == partial_job["job_id"]
+        ]
+        assert leftover and leftover[0]["worker_id"] == "worker-a"
+
+        worker_b = start_worker(restored_db, "worker-b")
+        try:
+            final = wait_for(
+                lambda: (state := get(port, f"/jobs/{partial_job['job_id']}"))["status"]
+                == "completed"
+                and state,
+                120,
+                "resumed completion",
+            )
+        finally:
+            stop(worker_b)
+
+        events = get(port, f"/jobs/{partial_job['job_id']}/events")
+        starts = [e for e in events if e["event"] == "training_started"]
+        assert starts[-1]["detail"]["worker_id"] == "worker-b"
+        assert starts[-1]["detail"]["resumed_from_step"] == restored_steps
+        checkpoints = get(port, f"/jobs/{partial_job['job_id']}/checkpoints")
+        assert [c["step"] for c in checkpoints] == list(range(1, final["total_steps"] + 1))
+        # The completed job was not retrained after the restore.
+        assert get(port, f"/jobs/{done_job['job_id']}/checkpoints") == done_checkpoints
+        assert get(port, f"/jobs/{done_job['job_id']}/events") == done_events
+    finally:
+        stop(api)
+    print(
+        f"  PASS: snapshot restored at step {restored_steps}/{final['total_steps']} onto a"
+        f" fresh volume; worker-b resumed past the leftover lease and finished,"
+        f" completed job untouched"
+    )
+    return True
+
+
 def main() -> int:
     failures = []
     with tempfile.TemporaryDirectory() as raw:
@@ -279,6 +359,7 @@ def main() -> int:
             ("compose", check_compose),
             ("killed-worker equivalence", lambda: check_equivalence(tmp)),
             ("late-worker fencing", lambda: check_late_worker(tmp)),
+            ("snapshot restore", lambda: check_snapshot_restore(tmp)),
         ):
             print(f"[{name}]")
             try:
